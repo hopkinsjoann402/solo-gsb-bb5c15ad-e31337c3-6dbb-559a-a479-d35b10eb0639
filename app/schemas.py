@@ -112,3 +112,62 @@ class CapacityUpgradeResult(BaseModel):
     assignments: list[AssignmentItem] = Field(..., description="扩容后的设备分配")
     loads: Loads = Field(..., description="建议容量下各相的实际负载")
     message: str
+
+
+class RobustDeviceIn(BaseModel):
+    """稳健预演的单台设备：功率为正整数区间 [min_power, max_power]。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="设备唯一编号")
+    min_power: int = Field(..., gt=0, description="功率下界（正整数）")
+    max_power: int = Field(..., gt=0, description="功率上界（正整数）")
+    allowed_phases: list[Phase] = Field(
+        ..., min_length=1, description="可接入相位集合，非空，元素取自 A/B/C"
+    )
+
+    @field_validator("allowed_phases")
+    @classmethod
+    def _dedupe_and_order(cls, value: list[str]) -> list[str]:
+        """去重并按 A/B/C 固定顺序排列。"""
+        return sorted(set(value), key=_PHASE_ORDER.__getitem__)
+
+    @model_validator(mode="after")
+    def _min_not_above_max(self) -> "RobustDeviceIn":
+        if self.min_power > self.max_power:
+            raise ValueError("功率下界不能大于上界")
+        return self
+
+
+class RobustRehearsalRequest(BaseModel):
+    """稳健分相预演请求体（仅预演，不写入历史计算记录）。"""
+
+    capacities: Capacities
+    devices: list[RobustDeviceIn] = Field(
+        ..., min_length=1, max_length=12, description="设备列表，1~12 台"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "RobustRehearsalRequest":
+        ids = [d.id for d in self.devices]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class RobustRehearsalResult(BaseModel):
+    """稳健分相预演结果。"""
+
+    capacities: Loads = Field(..., description="各相容量（回显请求输入）")
+    feasible: bool = Field(..., description="是否存在稳健可行分配")
+    worst_imbalance: Optional[int] = Field(
+        None, description="任意功率组合下三相最大负载与最小负载之差的最大值"
+    )
+    load_lower_bounds: Optional[Loads] = Field(
+        None, description="各相负载下界（该相设备均取功率下界之和）"
+    )
+    load_upper_bounds: Optional[Loads] = Field(
+        None, description="各相负载上界（该相设备均取功率上界之和）"
+    )
+    assignments: list[AssignmentItem] = Field(
+        ..., description="稳健分配方案（按设备编号排序）；无解时为空"
+    )
+    message: str

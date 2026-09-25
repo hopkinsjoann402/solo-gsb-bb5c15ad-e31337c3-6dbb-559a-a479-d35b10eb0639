@@ -14,6 +14,16 @@
 1) 三相扩容总量最小；2) 单相最大扩容量最小；3) 仍相同时取按设备编号排序的
 相位序列字典序最小。枚举所有相位序列（至多 3^12），分两遍 DFS 配合
 扩容总量 / 单相扩容量的上下界剪枝求解。
+
+稳健分相预演（solve_robust）：每台设备功率为正整数区间 [min_power, max_power]，
+区间内可独立取任意整数。对固定分配，某相负载可独立取遍
+[该相 min_power 之和, 该相 max_power 之和] 内的所有整数，因此：
+- 稳健可行（任意功率组合下各相均不超容量）⟺ 各相负载上界不超容量；
+- 任意功率组合可能产生的最坏负载差
+  = max_{L}(max_p L_p - min_p L_p) = max_{p≠q}(上界_p - 下界_q)
+  （注意不是「上界最大值 - 下界最小值」：同一相不可能同时取到上界与下界）。
+据此归约为与 solve 同构的 DFS：容量约束作用于负载上界，目标函数为上述
+有序相异相位对差值的最大值，同值时取按设备编号排序的相位序列字典序最小者。
 """
 
 from __future__ import annotations
@@ -302,4 +312,160 @@ def solve_capacity_upgrade(
         loads=final_loads,
         total_upgrade=sum(upgrades.values()),
         max_upgrade=max(upgrades.values()),
+    )
+
+
+@dataclass(frozen=True)
+class RobustDevice:
+    """稳健预演设备：功率为正整数区间 [min_power, max_power]。"""
+
+    code: str  # 设备唯一编号
+    min_power: int  # 功率下界（正整数）
+    max_power: int  # 功率上界（正整数，不小于下界）
+    allowed: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+
+
+@dataclass(frozen=True)
+class RobustResult:
+    """稳健预演求解结果。feasible 为 False 时其余字段为 None。
+
+    load_lower / load_upper：各相负载下界 / 上界（该相设备分别取功率
+    下界 / 上界之和）；worst_imbalance：任意功率组合下「三相负载最大值
+    与最小值之差」可能达到的最大值。
+    """
+
+    feasible: bool
+    assignment: Optional[dict[str, str]]  # 设备编号 -> 相位
+    load_lower: Optional[dict[str, int]]  # 相位 -> 负载下界
+    load_upper: Optional[dict[str, int]]  # 相位 -> 负载上界
+    worst_imbalance: Optional[int]  # 最坏负载差
+
+
+def solve_robust(
+    devices: Iterable[RobustDevice], capacities: dict[str, int]
+) -> RobustResult:
+    """求解稳健分相预演：任意功率组合下各相均不超容量，且最坏负载差最小。
+
+    对固定分配，各相负载独立取遍 [下界, 上界] 内的所有整数，故：
+    - 稳健可行 ⟺ 各相负载上界（max_power 之和）不超过对应容量；
+    - 最坏负载差 = max_{p≠q}(上界_p - 下界_q)
+      （max_L(max_p L_p - min_p L_p) = max_{p≠q} max_L(L_p - L_q)，
+      同一相不可能同时取到上界与下界，故只取相异相位对）。
+
+    目标：在稳健可行方案中最小化最坏负载差；同值时取按设备编号排序的
+    相位序列字典序最小者。搜索结构与 solve 相同：按设备编号排序 DFS、
+    相位按 A/B/C 展开、仅严格更优才更新，配合容量约束与下界剪枝。
+
+    :param devices: 设备集合（编号唯一、0 < min_power <= max_power、允许相位非空）。
+    :param capacities: 各相容量，形如 {"A": int, "B": int, "C": int}。
+    :return: RobustResult；无稳健可行分配时 feasible=False。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    lows = [d.min_power for d in ordered]
+    highs = [d.max_power for d in ordered]
+    # 每个设备的可接入相位按 A/B/C 固定顺序排列，保证 DFS 按字典序枚举方案
+    allowed = [tuple(p for p in PHASES if p in d.allowed) for d in ordered]
+    caps = {p: capacities[p] for p in PHASES}
+
+    # suffix_addable_lo[i][p]：第 i..n-1 台设备中可接入相位 p 的功率下界和（剪枝用）
+    suffix_addable_lo = [{p: 0 for p in PHASES} for _ in range(n + 1)]
+    # suffix_forced_hi[i][p]：第 i..n-1 台设备中只允许相位 p 的设备功率上界和（剪枝用）
+    suffix_forced_hi = [{p: 0 for p in PHASES} for _ in range(n + 1)]
+    # suffix_forced_lo[i][p]：同上，功率下界和（剪枝用）
+    suffix_forced_lo = [{p: 0 for p in PHASES} for _ in range(n + 1)]
+    # suffix_lo[i] / suffix_hi[i]：第 i..n-1 台设备的功率下界 / 上界总和
+    suffix_lo = [0] * (n + 1)
+    suffix_hi = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        prev_lo, cur_lo = suffix_addable_lo[i + 1], suffix_addable_lo[i]
+        prev_fh, cur_fh = suffix_forced_hi[i + 1], suffix_forced_hi[i]
+        prev_fl, cur_fl = suffix_forced_lo[i + 1], suffix_forced_lo[i]
+        for p in PHASES:
+            cur_lo[p] = prev_lo[p] + (lows[i] if p in allowed[i] else 0)
+            forced = highs[i] if allowed[i] == (p,) else 0
+            cur_fh[p] = prev_fh[p] + forced
+            cur_fl[p] = prev_fl[p] + (lows[i] if allowed[i] == (p,) else 0)
+        suffix_lo[i] = suffix_lo[i + 1] + lows[i]
+        suffix_hi[i] = suffix_hi[i + 1] + highs[i]
+
+    lower = {p: 0 for p in PHASES}
+    upper = {p: 0 for p in PHASES}
+    current: list[Optional[str]] = [None] * n
+    best_imbalance: Optional[int] = None
+    best_assignment: Optional[list[str]] = None
+
+    def dfs(i: int, used_lo: int, used_hi: int) -> None:
+        nonlocal best_imbalance, best_assignment
+        if best_imbalance == 0:
+            return  # 已达成理论最优（最坏负载差为 0），无需继续搜索
+        if i == n:
+            # 最坏负载差 = max_{p≠q}(上界_p - 下界_q)
+            imbalance = max(
+                upper[p] - lower[q] for p in PHASES for q in PHASES if p != q
+            )
+            # 仅严格更优才更新：同差值时先枚举到的方案字典序更小
+            if best_imbalance is None or imbalance < best_imbalance:
+                best_imbalance = imbalance
+                best_assignment = current.copy()
+            return
+        if best_imbalance is not None:
+            # 下界剪枝一（相位对）：对任意有序相异相位对 (p, q)，
+            #   最终上界_p >= 当前上界_p + 剩余被迫接入 p 的上界和
+            #   最终下界_q <= 当前下界_q + 剩余可接入 q 的下界和
+            lb = max(
+                upper[p] + suffix_forced_hi[i][p] - lower[q] - suffix_addable_lo[i][q]
+                for p in PHASES
+                for q in PHASES
+                if p != q
+            )
+            # 下界剪枝二（总量平均）：设 p* 为最终上界最大的相位，则
+            #   最终上界最大值 >= ceil(上界总和 / 3)
+            #   其余两相最终下界的最小值 <= (下界总和 - p* 相下界) / 2
+            #     <= (下界总和 - 各相被迫下界的最小值) / 2
+            total_lo = used_lo + suffix_lo[i]
+            total_hi = used_hi + suffix_hi[i]
+            min_forced_lo = min(
+                lower[p] + suffix_forced_lo[i][p] for p in PHASES
+            )
+            lb = max(
+                lb,
+                ceil(total_hi / 3) - (total_lo - min_forced_lo) // 2,
+            )
+            if lb >= best_imbalance:
+                return
+        for phase in allowed[i]:
+            # 稳健可行性：任意功率组合下不超容量 ⟺ 负载上界不超容量
+            if upper[phase] + highs[i] <= caps[phase]:
+                lower[phase] += lows[i]
+                upper[phase] += highs[i]
+                current[i] = phase
+                dfs(i + 1, used_lo + lows[i], used_hi + highs[i])
+                lower[phase] -= lows[i]
+                upper[phase] -= highs[i]
+                current[i] = None
+
+    dfs(0, 0, 0)
+
+    if best_assignment is None:
+        return RobustResult(
+            feasible=False,
+            assignment=None,
+            load_lower=None,
+            load_upper=None,
+            worst_imbalance=None,
+        )
+
+    final_lower = {p: 0 for p in PHASES}
+    final_upper = {p: 0 for p in PHASES}
+    for idx, phase in enumerate(best_assignment):
+        final_lower[phase] += lows[idx]
+        final_upper[phase] += highs[idx]
+    assignment = {ordered[i].code: best_assignment[i] for i in range(n)}
+    return RobustResult(
+        feasible=True,
+        assignment=assignment,
+        load_lower=final_lower,
+        load_upper=final_upper,
+        worst_imbalance=best_imbalance,
     )

@@ -15,14 +15,23 @@ from .schemas import (
     CalculationSummary,
     CapacityUpgradeResult,
     Loads,
+    RobustRehearsalRequest,
+    RobustRehearsalResult,
 )
-from .solver import Device, solve, solve_capacity_upgrade
+from .solver import Device, RobustDevice, solve, solve_capacity_upgrade, solve_robust
 
 _MESSAGE_FEASIBLE = "计算成功：已找到三相负载最大值与最小值之差最小的分配方案"
 _MESSAGE_INFEASIBLE = "无可行分配：不存在所有设备均接入且各相不超容量的方案"
 _MESSAGE_UPGRADE = (
     "扩容建议：已在最小化三相扩容总量、再最小化单相最大扩容量的目标下，"
     "找到使所有设备均接入的容量与分配方案"
+)
+_MESSAGE_ROBUST_FEASIBLE = (
+    "预演成功：已找到任意功率组合下各相均不超容量、"
+    "且最坏负载差最小的稳健分配方案"
+)
+_MESSAGE_ROBUST_INFEASIBLE = (
+    "无稳健可行分配：不存在任意功率组合下各相均不超容量的接入方案"
 )
 
 
@@ -40,6 +49,8 @@ app = FastAPI(
         "及 A/B/C 各相容量，求解使三相负载最大值与最小值之差最小的分配方案；"
         "差值相同时取按设备编号排序后相位序列字典序最小的方案。"
         "每次计算的输入、分配结果与各相负载均持久化，可随时查询。"
+        "另提供稳健分相预演：设备功率为正整数区间，求解任意功率组合下"
+        "各相均不超容量、且最坏负载差最小的分配（仅预演，不持久化）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -199,4 +210,56 @@ def capacity_upgrade(calculation_id: int) -> CapacityUpgradeResult:
         assignments=assignments,
         loads=Loads(**upgrade.loads),
         message=_MESSAGE_UPGRADE,
+    )
+
+
+@app.post(
+    "/api/v1/robust-rehearsals",
+    response_model=RobustRehearsalResult,
+    tags=["rehearsals"],
+)
+def robust_rehearsal(payload: RobustRehearsalRequest) -> RobustRehearsalResult:
+    """稳健分相预演：设备功率为正整数区间，求解稳健最优分配。
+
+    每台设备功率可在 [min_power, max_power] 内独立变化。寻找每台设备接入
+    一个允许相位、且任意功率组合下各相均不超容量的分配；在稳健可行方案中
+    最小化任意功率组合可能产生的三相最大负载与最小负载之差，同值时取
+    按设备编号排序的相位序列字典序最小者。
+
+    仅做预演，不写入历史计算记录；无稳健可行方案时返回 ``feasible=false``。
+    """
+    devices = [
+        RobustDevice(
+            code=d.id,
+            min_power=d.min_power,
+            max_power=d.max_power,
+            allowed=tuple(d.allowed_phases),
+        )
+        for d in payload.devices
+    ]
+    capacities = {
+        "A": payload.capacities.A,
+        "B": payload.capacities.B,
+        "C": payload.capacities.C,
+    }
+    result = solve_robust(devices, capacities)
+
+    assignments = (
+        [
+            AssignmentItem(device_id=code, phase=result.assignment[code])
+            for code in sorted(result.assignment)
+        ]
+        if result.feasible
+        else []
+    )
+    return RobustRehearsalResult(
+        capacities=Loads(**capacities),
+        feasible=result.feasible,
+        worst_imbalance=result.worst_imbalance,
+        load_lower_bounds=Loads(**result.load_lower) if result.feasible else None,
+        load_upper_bounds=Loads(**result.load_upper) if result.feasible else None,
+        assignments=assignments,
+        message=(
+            _MESSAGE_ROBUST_FEASIBLE if result.feasible else _MESSAGE_ROBUST_INFEASIBLE
+        ),
     )
