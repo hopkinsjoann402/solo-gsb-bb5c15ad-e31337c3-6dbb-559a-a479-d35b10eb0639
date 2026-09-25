@@ -15,14 +15,26 @@ from .schemas import (
     CalculationSummary,
     CapacityUpgradeResult,
     Loads,
+    LoadRanges,
+    PhaseLoadRange,
+    RobustPreviewRequest,
+    RobustPreviewResult,
 )
-from .solver import Device, solve, solve_capacity_upgrade
+from .solver import Device, RobustDevice, solve, solve_capacity_upgrade, solve_robust
 
 _MESSAGE_FEASIBLE = "计算成功：已找到三相负载最大值与最小值之差最小的分配方案"
 _MESSAGE_INFEASIBLE = "无可行分配：不存在所有设备均接入且各相不超容量的方案"
 _MESSAGE_UPGRADE = (
     "扩容建议：已在最小化三相扩容总量、再最小化单相最大扩容量的目标下，"
     "找到使所有设备均接入的容量与分配方案"
+)
+_MESSAGE_ROBUST_FEASIBLE = (
+    "稳健预演成功：已找到使各设备功率在区间内任意取值时各相均不超容量的分配，"
+    "并最小化最坏情形下三相最大负载与最小负载之差"
+)
+_MESSAGE_ROBUST_INFEASIBLE = (
+    "无稳健可行分配：不存在任何相位分配，能保证各设备功率在区间内任意取值时"
+    "各相均不超容量"
 )
 
 
@@ -40,8 +52,11 @@ app = FastAPI(
         "及 A/B/C 各相容量，求解使三相负载最大值与最小值之差最小的分配方案；"
         "差值相同时取按设备编号排序后相位序列字典序最小的方案。"
         "每次计算的输入、分配结果与各相负载均持久化，可随时查询。"
+        "另提供稳健分相预演接口：设备功率以正整数区间 [min_power, max_power] "
+        "给出，求解任意功率组合下各相均不超容量、并最小化最坏负载差的分配，"
+        "预演不写入历史计算记录。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -50,6 +65,70 @@ app = FastAPI(
 def health() -> dict:
     """健康检查。"""
     return {"status": "ok"}
+
+
+@app.post(
+    "/api/v1/robust-preview",
+    response_model=RobustPreviewResult,
+    tags=["robust-preview"],
+)
+def robust_preview(payload: RobustPreviewRequest) -> RobustPreviewResult:
+    """稳健分相预演：功率区间不确定下的稳健最优分配。
+
+    每台设备功率可在 ``[min_power, max_power]`` 内独立变化。寻找一种相位
+    分配，使**任意**功率组合下各相负载均不超容量（以各相设备功率上界之和
+    不超容量为准）；在所有稳健可行方案中，最小化「任意功率组合可能产生的
+    三相最大负载与最小负载之差」的最坏值；同值时取按设备编号排序的相位序列
+    字典序最小者。
+
+    本接口只做预演，**不写入历史计算记录**。
+    """
+    devices = [
+        RobustDevice(
+            code=d.id,
+            min_power=d.min_power,
+            max_power=d.max_power,
+            allowed=tuple(d.allowed_phases),
+        )
+        for d in payload.devices
+    ]
+    capacities = {
+        "A": payload.capacities.A,
+        "B": payload.capacities.B,
+        "C": payload.capacities.C,
+    }
+    result = solve_robust(devices, capacities)
+
+    if not result.feasible:
+        return RobustPreviewResult(
+            capacities=Loads(**capacities),
+            feasible=False,
+            worst_imbalance=None,
+            load_ranges=None,
+            assignments=[],
+            message=_MESSAGE_ROBUST_INFEASIBLE,
+        )
+
+    assignments = [
+        AssignmentItem(device_id=code, phase=result.assignment[code])
+        for code in sorted(result.assignment)
+    ]
+    load_ranges = LoadRanges(
+        **{
+            p: PhaseLoadRange(
+                lower=result.load_lower[p], upper=result.load_upper[p]
+            )
+            for p in ("A", "B", "C")
+        }
+    )
+    return RobustPreviewResult(
+        capacities=Loads(**capacities),
+        feasible=True,
+        worst_imbalance=result.worst_imbalance,
+        load_ranges=load_ranges,
+        assignments=assignments,
+        message=_MESSAGE_ROBUST_FEASIBLE,
+    )
 
 
 @app.post(

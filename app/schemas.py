@@ -45,10 +45,15 @@ class CalculationRequest(BaseModel):
 
     @model_validator(mode="after")
     def _unique_device_ids(self) -> "CalculationRequest":
-        ids = [d.id for d in self.devices]
-        if len(ids) != len(set(ids)):
-            raise ValueError("设备编号必须唯一")
+        _require_unique_device_ids(self.devices)
         return self
+
+
+def _require_unique_device_ids(devices: list) -> None:
+    """设备编号必须唯一。"""
+    ids = [d.id for d in devices]
+    if len(ids) != len(set(ids)):
+        raise ValueError("设备编号必须唯一")
 
 
 class Loads(BaseModel):
@@ -111,4 +116,78 @@ class CapacityUpgradeResult(BaseModel):
     max_upgrade: int = Field(..., ge=0, description="单相最大扩容量")
     assignments: list[AssignmentItem] = Field(..., description="扩容后的设备分配")
     loads: Loads = Field(..., description="建议容量下各相的实际负载")
+    message: str
+
+
+class RobustDeviceIn(BaseModel):
+    """稳健预演中的单台设备：功率在正整数区间 [min_power, max_power] 内变化。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="设备唯一编号")
+    min_power: int = Field(..., gt=0, description="设备功率下界（正整数）")
+    max_power: int = Field(..., gt=0, description="设备功率上界（正整数，不小于下界）")
+    allowed_phases: list[Phase] = Field(
+        ..., min_length=1, description="可接入相位集合，非空，元素取自 A/B/C"
+    )
+
+    @field_validator("allowed_phases")
+    @classmethod
+    def _dedupe_and_order(cls, value: list[str]) -> list[str]:
+        """去重并按 A/B/C 固定顺序排列。"""
+        return sorted(set(value), key=_PHASE_ORDER.__getitem__)
+
+    @model_validator(mode="after")
+    def _min_not_greater_than_max(self) -> "RobustDeviceIn":
+        if self.min_power > self.max_power:
+            raise ValueError(
+                f"设备 {self.id} 的 min_power 不能大于 max_power："
+                f"{self.min_power} > {self.max_power}"
+            )
+        return self
+
+
+class RobustPreviewRequest(BaseModel):
+    """稳健分相预演请求体（仅预演，不写入历史计算记录）。"""
+
+    capacities: Capacities
+    devices: list[RobustDeviceIn] = Field(
+        ..., min_length=1, max_length=12, description="设备列表，1~12 台"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "RobustPreviewRequest":
+        _require_unique_device_ids(self.devices)
+        return self
+
+
+class PhaseLoadRange(BaseModel):
+    """单相负载的取值范围。"""
+
+    lower: int = Field(..., ge=0, description="该相负载下界（该相设备功率下界之和）")
+    upper: int = Field(..., ge=0, description="该相负载上界（该相设备功率上界之和）")
+
+
+class LoadRanges(BaseModel):
+    """A/B/C 各相负载的下界与上界。"""
+
+    A: PhaseLoadRange
+    B: PhaseLoadRange
+    C: PhaseLoadRange
+
+
+class RobustPreviewResult(BaseModel):
+    """稳健分相预演结果（不持久化，无记录 id / 创建时间）。"""
+
+    capacities: Loads = Field(..., description="各相容量")
+    feasible: bool = Field(..., description="是否存在稳健可行的分配")
+    worst_imbalance: Optional[int] = Field(
+        None,
+        ge=0,
+        description="最坏负载差：任意功率组合下三相最大负载与最小负载之差的最大值",
+    )
+    load_ranges: Optional[LoadRanges] = Field(
+        None, description="该分配下各相负载的下界与上界"
+    )
+    assignments: list[AssignmentItem] = Field(
+        default_factory=list, description="设备的稳健相位分配（按设备编号排序）"
+    )
     message: str

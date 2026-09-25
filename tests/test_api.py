@@ -3,6 +3,7 @@
 运行方式：python3 -m pytest tests/test_api.py
 """
 
+import json
 import os
 import tempfile
 
@@ -229,3 +230,158 @@ def test_capacity_upgrade_single_forced_phase():
     assert body["loads"] == {"A": 110, "B": 0, "C": 0}
     assert body["total_upgrade"] == 10
     assert body["max_upgrade"] == 10
+
+
+ROBUST_VALID_PAYLOAD = {
+    "capacities": {"A": 100, "B": 100, "C": 100},
+    "devices": [
+        {"id": "D1", "min_power": 8, "max_power": 12, "allowed_phases": ["A", "B", "C"]},
+        {"id": "D2", "min_power": 8, "max_power": 12, "allowed_phases": ["A", "B", "C"]},
+        {"id": "D3", "min_power": 8, "max_power": 12, "allowed_phases": ["A", "B", "C"]},
+    ],
+}
+
+
+def test_robust_preview_feasible():
+    before = len(client.get("/api/v1/calculations").json())
+    resp = client.post("/api/v1/robust-preview", json=ROBUST_VALID_PAYLOAD)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    assert body["capacities"] == {"A": 100, "B": 100, "C": 100}
+    # 每相一台：上界 12 / 下界 8，最坏负载差 = 12 - 8 = 4
+    assert body["worst_imbalance"] == 4
+    assert body["load_ranges"] == {
+        "A": {"lower": 8, "upper": 12},
+        "B": {"lower": 8, "upper": 12},
+        "C": {"lower": 8, "upper": 12},
+    }
+    assert body["assignments"] == [
+        {"device_id": "D1", "phase": "A"},
+        {"device_id": "D2", "phase": "B"},
+        {"device_id": "D3", "phase": "C"},
+    ]
+    assert "稳健" in body["message"]
+    # 预演不写入历史记录
+    after = len(client.get("/api/v1/calculations").json())
+    assert after == before
+
+
+def test_robust_preview_infeasible():
+    payload = {
+        "capacities": {"A": 9, "B": 0, "C": 0},
+        "devices": [
+            {"id": "D1", "min_power": 5, "max_power": 10, "allowed_phases": ["A"]}
+        ],
+    }
+    resp = client.post("/api/v1/robust-preview", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is False
+    assert body["worst_imbalance"] is None
+    assert body["load_ranges"] is None
+    assert body["assignments"] == []
+    assert "无稳健可行" in body["message"]
+
+
+def test_robust_preview_does_not_persist_on_infeasible():
+    before = len(client.get("/api/v1/calculations").json())
+    payload = {
+        "capacities": {"A": 1, "B": 1, "C": 1},
+        "devices": [
+            {"id": "D1", "min_power": 5, "max_power": 10, "allowed_phases": ["A"]}
+        ],
+    }
+    client.post("/api/v1/robust-preview", json=payload)
+    after = len(client.get("/api/v1/calculations").json())
+    assert after == before
+
+
+def test_robust_preview_assignments_sorted_by_device_id():
+    payload = {
+        "capacities": {"A": 100, "B": 100, "C": 100},
+        "devices": [
+            {"id": "Z9", "min_power": 3, "max_power": 4, "allowed_phases": ["A", "B", "C"]},
+            {"id": "A1", "min_power": 3, "max_power": 4, "allowed_phases": ["A", "B", "C"]},
+        ],
+    }
+    body = client.post("/api/v1/robust-preview", json=payload).json()
+    assert [a["device_id"] for a in body["assignments"]] == ["A1", "Z9"]
+
+
+def test_robust_preview_point_power_accepted():
+    # min_power == max_power 合法（固定功率的特例）
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "min_power": 5, "max_power": 5, "allowed_phases": ["A"]}
+        ],
+    }
+    resp = client.post("/api/v1/robust-preview", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["feasible"] is True
+
+
+def test_robust_validation_min_greater_than_max():
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "min_power": 9, "max_power": 5, "allowed_phases": ["A"]}
+        ],
+    }
+    assert client.post("/api/v1/robust-preview", json=payload).status_code == 422
+
+
+def test_robust_validation_non_positive_power():
+    base = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "min_power": 1, "max_power": 5, "allowed_phases": ["A"]}
+        ],
+    }
+    for field in ("min_power", "max_power"):
+        p = json.loads(json.dumps(base))
+        p["devices"][0][field] = 0
+        assert client.post("/api/v1/robust-preview", json=p).status_code == 422
+
+
+def test_robust_validation_duplicate_ids():
+    payload = {
+        "capacities": {"A": 50, "B": 50, "C": 50},
+        "devices": [
+            {"id": "D1", "min_power": 1, "max_power": 5, "allowed_phases": ["A"]},
+            {"id": "D1", "min_power": 1, "max_power": 5, "allowed_phases": ["B"]},
+        ],
+    }
+    assert client.post("/api/v1/robust-preview", json=payload).status_code == 422
+
+
+def test_robust_validation_too_many_devices():
+    payload = {
+        "capacities": {"A": 1000, "B": 1000, "C": 1000},
+        "devices": [
+            {"id": f"D{i}", "min_power": 1, "max_power": 2, "allowed_phases": ["A"]}
+            for i in range(13)
+        ],
+    }
+    assert client.post("/api/v1/robust-preview", json=payload).status_code == 422
+
+
+def test_robust_validation_empty_allowed_phases():
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "min_power": 1, "max_power": 5, "allowed_phases": []}
+        ],
+    }
+    assert client.post("/api/v1/robust-preview", json=payload).status_code == 422
+
+
+def test_robust_validation_invalid_phase():
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "min_power": 1, "max_power": 5, "allowed_phases": ["D"]}
+        ],
+    }
+    assert client.post("/api/v1/robust-preview", json=payload).status_code == 422
